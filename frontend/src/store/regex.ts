@@ -4,7 +4,8 @@ import type { NFA, MatchResult, MatchStep, RegexTemplate, ASTNode } from '../typ
 
 const GROUP_COLORS = ['#ef4444', '#f97316', '#eab308', '#22c55e', '#3b82f6', '#8b5cf6', '#ec4899', '#14b8a6']
 
-export const TEMPLATES: RegexTemplate[] = [
+// 模板原始数据冻结为不可变：套用是按值复制，套用后的手动修改不会改坏模板原内容
+const TEMPLATE_DATA: RegexTemplate[] = [
   { name: '邮箱地址', pattern: '^([a-zA-Z0-9._%+-]+)@([a-zA-Z0-9.-]+)\\.([a-zA-Z]{2,})$', description: '匹配标准邮箱格式：用户名@域名.顶级域', testString: 'user@example.com admin@mail.org test.user+tag@sub.domain.co.uk', category: '常用' },
   { name: 'URL链接', pattern: '^(https?)://([^/:]+)(?::(\\d+))?(.*)$', description: '匹配HTTP/HTTPS URL：协议://主机:端口/路径', testString: 'https://www.example.com:8080/path/to/page http://localhost:3000/api', category: '常用' },
   { name: 'IPv4地址', pattern: '^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$', description: '匹配IPv4地址四段数字', testString: '192.168.1.1 10.0.0.1 255.255.255.0', category: '常用' },
@@ -27,6 +28,26 @@ export const TEMPLATES: RegexTemplate[] = [
   { name: '版本号', pattern: '^(\\d+)\\.(\\d+)\\.(\\d+)(?:-(\\w+))?$', description: '语义化版本号x.y.z-tag', testString: '1.0.0 2.3.1-beta 10.20.30', category: '常用' },
   { name: '时间格式', pattern: '^([01]?\\d|2[0-3]):([0-5]\\d)(?::([0-5]\\d))?$', description: 'HH:MM或HH:MM:SS', testString: '14:30 23:59:59 00:00', category: '常用' }
 ]
+
+export const TEMPLATES: readonly RegexTemplate[] = Object.freeze(TEMPLATE_DATA.map(t => Object.freeze({ ...t })))
+
+const FAV_STORAGE_KEY = 'regex-debugger:favorites'
+const RECENT_STORAGE_KEY = 'regex-debugger:recent-templates'
+const RECENT_LIMIT = 6
+
+// 从本地存储读取模板名列表；数据损坏或不可用时返回空数组，不影响当前会话状态
+function readNameList(key: string): string[] {
+  try {
+    const raw = localStorage.getItem(key)
+    if (!raw) return []
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    const validNames = new Set(TEMPLATES.map(t => t.name))
+    return [...new Set(parsed.filter((n): n is string => typeof n === 'string' && validNames.has(n)))]
+  } catch {
+    return []
+  }
+}
 
 interface StateNode {
   id: number
@@ -402,7 +423,60 @@ export const useRegexStore = defineStore('regex', () => {
   const error = ref('')
   const selectedTemplate = ref<string>('')
 
+  // 收藏与最近使用：从本地存储恢复，刷新后仍保留
+  const favorites = ref<string[]>(readNameList(FAV_STORAGE_KEY))
+  const recentTemplates = ref<string[]>(readNameList(RECENT_STORAGE_KEY).slice(0, RECENT_LIMIT))
+  const notice = ref('')
+  const storageError = ref(false)
+
   const groupColors = GROUP_COLORS
+
+  let noticeTimer: ReturnType<typeof setTimeout> | undefined
+  function showNotice(msg: string) {
+    notice.value = msg
+    if (noticeTimer) clearTimeout(noticeTimer)
+    noticeTimer = setTimeout(() => { notice.value = '' }, 3000)
+  }
+
+  // 本地保存失败时不清空内存状态：收藏/最近使用/当前选择在本次会话内仍然有效
+  function persist(): boolean {
+    try {
+      localStorage.setItem(FAV_STORAGE_KEY, JSON.stringify(favorites.value))
+      localStorage.setItem(RECENT_STORAGE_KEY, JSON.stringify(recentTemplates.value))
+      storageError.value = false
+      return true
+    } catch {
+      storageError.value = true
+      return false
+    }
+  }
+
+  function retryPersist() {
+    if (persist()) showNotice('本地保存已恢复，收藏与最近使用已写入')
+    else showNotice('本地保存仍然失败，当前数据仅在本次会话内有效')
+  }
+
+  const favoriteSet = computed(() => new Set(favorites.value))
+  const isFavorite = (name: string) => favoriteSet.value.has(name)
+  const favoriteTemplates = computed(() => TEMPLATES.filter(t => favoriteSet.value.has(t.name)))
+  const recentTemplateList = computed(() =>
+    recentTemplates.value
+      .map(n => TEMPLATES.find(t => t.name === n))
+      .filter((t): t is RegexTemplate => Boolean(t))
+  )
+
+  function toggleFavorite(name: string) {
+    // 已收藏时再次点击视为取消收藏；收藏列表加载时已去重，任何路径都不会产生重复收藏
+    if (favoriteSet.value.has(name)) {
+      favorites.value = favorites.value.filter(n => n !== name)
+      if (!persist()) showNotice(`已取消收藏「${name}」，但本地保存失败，刷新后可能恢复`)
+      else showNotice(`已取消收藏「${name}」`)
+      return
+    }
+    favorites.value = [...favorites.value, name]
+    if (!persist()) showNotice(`已收藏「${name}」，但本地保存失败，本次会话内仍然有效`)
+    else showNotice(`已收藏「${name}」，可在「★ 收藏」入口快速筛选`)
+  }
 
   const matchHighlight = computed(() => {
     if (!matchResult.value || !matchResult.value.matched) return null
@@ -443,9 +517,28 @@ export const useRegexStore = defineStore('regex', () => {
   }
 
   function applyTemplate(t: RegexTemplate) {
+    // 字符串按值复制到可编辑状态，之后的手动修改不会触碰模板原内容
     pattern.value = t.pattern
     testString.value = t.testString
     selectedTemplate.value = t.name
+    recentTemplates.value = [t.name, ...recentTemplates.value.filter(n => n !== t.name)].slice(0, RECENT_LIMIT)
+    if (!persist()) showNotice('最近使用未能保存到本地，刷新后可能丢失')
+    execute()
+  }
+
+  // 当前内容是否已被手动修改（相对已选模板原件）
+  const isTemplateModified = computed(() => {
+    const t = TEMPLATES.find(tpl => tpl.name === selectedTemplate.value)
+    return Boolean(t && (pattern.value !== t.pattern || testString.value !== t.testString))
+  })
+
+  // 恢复方式：一键还原为模板原始内容
+  function restoreTemplate() {
+    const t = TEMPLATES.find(tpl => tpl.name === selectedTemplate.value)
+    if (!t) return
+    pattern.value = t.pattern
+    testString.value = t.testString
+    showNotice(`已恢复「${t.name}」的原始内容`)
     execute()
   }
 
@@ -482,7 +575,10 @@ export const useRegexStore = defineStore('regex', () => {
   return {
     pattern, testString, currentStep, isPlaying, nfa, matchResult, ast, error,
     selectedTemplate, groupColors, matchHighlight,
+    favorites, recentTemplates, notice, storageError,
+    favoriteTemplates, recentTemplateList, isTemplateModified,
     execute, setPattern, setTestString, applyTemplate,
+    isFavorite, toggleFavorite, retryPersist, restoreTemplate,
     stepForward, stepBackward, resetStep, play, stop
   }
 })

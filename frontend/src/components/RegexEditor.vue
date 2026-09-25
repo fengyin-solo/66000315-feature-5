@@ -26,12 +26,16 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 import { useRegexStore } from '../store/regex'
 
 const store = useRegexStore()
 const localPattern = ref(store.pattern)
 const localTestString = ref(store.testString)
+
+// 套用模板 / 恢复模板后，把 store 中的内容同步到编辑框，手动修改基于该副本进行
+watch(() => store.pattern, v => { localPattern.value = v })
+watch(() => store.testString, v => { localTestString.value = v })
 
 let debounceTimer: ReturnType<typeof setTimeout>
 function onInput() {
