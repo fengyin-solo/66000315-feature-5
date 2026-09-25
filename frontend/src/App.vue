@@ -54,6 +54,8 @@
         </div>
       </div>
     </div>
+
+    <ToastHost />
   </div>
 </template>
 
@@ -64,6 +66,7 @@ import RegexEditor from './components/RegexEditor.vue'
 import NfaVisualizer from './components/NfaVisualizer.vue'
 import MatchHighlight from './components/MatchHighlight.vue'
 import TemplateLibrary from './components/TemplateLibrary.vue'
+import ToastHost from './components/ToastHost.vue'
 
 const store = useRegexStore()
 onMounted(() => store.execute())

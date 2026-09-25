@@ -55,3 +55,18 @@ export interface ASTNode {
   children?: ASTNode[]
   groupIndex?: number
 }
+
+export type TemplateTab = 'all' | 'favorites' | 'recent'
+
+export interface ToastAction {
+  label: string
+  handler: () => void
+}
+
+export interface Toast {
+  id: number
+  type: 'success' | 'info' | 'error'
+  message: string
+  action?: ToastAction
+  persistent?: boolean
+}

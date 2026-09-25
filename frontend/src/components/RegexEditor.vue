@@ -26,12 +26,16 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 import { useRegexStore } from '../store/regex'
 
 const store = useRegexStore()
 const localPattern = ref(store.pattern)
 const localTestString = ref(store.testString)
+
+// 套用模板后同步到输入框，之后用户的手动修改只作用于编辑器，不影响模板原内容
+watch(() => store.pattern, p => { localPattern.value = p })
+watch(() => store.testString, s => { localTestString.value = s })
 
 let debounceTimer: ReturnType<typeof setTimeout>
 function onInput() {

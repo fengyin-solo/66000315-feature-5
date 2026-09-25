@@ -1,8 +1,11 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import type { NFA, MatchResult, MatchStep, RegexTemplate, ASTNode } from '../types'
+import type { NFA, MatchResult, MatchStep, RegexTemplate, ASTNode, TemplateTab, Toast, ToastAction } from '../types'
 
 const GROUP_COLORS = ['#ef4444', '#f97316', '#eab308', '#22c55e', '#3b82f6', '#8b5cf6', '#ec4899', '#14b8a6']
+
+const PREFS_STORAGE_KEY = 'regex-visual-debugger:template-prefs:v1'
+const RECENT_LIMIT = 10
 
 export const TEMPLATES: RegexTemplate[] = [
   { name: '邮箱地址', pattern: '^([a-zA-Z0-9._%+-]+)@([a-zA-Z0-9.-]+)\\.([a-zA-Z]{2,})$', description: '匹配标准邮箱格式：用户名@域名.顶级域', testString: 'user@example.com admin@mail.org test.user+tag@sub.domain.co.uk', category: '常用' },
@@ -27,6 +30,10 @@ export const TEMPLATES: RegexTemplate[] = [
   { name: '版本号', pattern: '^(\\d+)\\.(\\d+)\\.(\\d+)(?:-(\\w+))?$', description: '语义化版本号x.y.z-tag', testString: '1.0.0 2.3.1-beta 10.20.30', category: '常用' },
   { name: '时间格式', pattern: '^([01]?\\d|2[0-3]):([0-5]\\d)(?::([0-5]\\d))?$', description: 'HH:MM或HH:MM:SS', testString: '14:30 23:59:59 00:00', category: '常用' }
 ]
+
+// 冻结模板数据：套用后用户手动修改的是编辑器里的副本，模板原内容不可被改坏
+Object.freeze(TEMPLATES)
+TEMPLATES.forEach(t => Object.freeze(t))
 
 interface StateNode {
   id: number
@@ -402,6 +409,16 @@ export const useRegexStore = defineStore('regex', () => {
   const error = ref('')
   const selectedTemplate = ref<string>('')
 
+  // ---- 模板收藏 / 最近使用 / 筛选 ----
+  const favorites = ref<string[]>([])
+  const recentUsed = ref<string[]>([])
+  const templateSearch = ref('')
+  const templateTab = ref<TemplateTab>('all')
+  const templateCategory = ref('')
+  const toasts = ref<Toast[]>([])
+  let toastSeq = 0
+  let storageErrorToastId: number | null = null
+
   const groupColors = GROUP_COLORS
 
   const matchHighlight = computed(() => {
@@ -415,6 +432,123 @@ export const useRegexStore = defineStore('regex', () => {
       after: testString.value.substring(idx + matchText.length)
     }
   })
+
+  function dismissToast(id: number) {
+    toasts.value = toasts.value.filter(t => t.id !== id)
+  }
+
+  function notify(type: Toast['type'], message: string, action?: ToastAction, persistent = false): number {
+    const id = ++toastSeq
+    toasts.value.push({ id, type, message, action, persistent })
+    if (!persistent) setTimeout(() => dismissToast(id), 4000)
+    return id
+  }
+
+  // 本地保存失败时保留内存中的状态，并给出可重试的恢复入口
+  function persistTemplatePrefs(): boolean {
+    try {
+      localStorage.setItem(PREFS_STORAGE_KEY, JSON.stringify({ favorites: favorites.value, recent: recentUsed.value }))
+    } catch {
+      if (storageErrorToastId === null) {
+        storageErrorToastId = notify('error', '本地保存失败：本次收藏/最近使用变更可能在刷新后丢失', { label: '重试', handler: () => persistTemplatePrefs() }, true)
+      }
+      return false
+    }
+    if (storageErrorToastId !== null) {
+      dismissToast(storageErrorToastId)
+      storageErrorToastId = null
+      notify('success', '本地保存已恢复')
+    }
+    return true
+  }
+
+  function loadTemplatePrefs() {
+    try {
+      const raw = localStorage.getItem(PREFS_STORAGE_KEY)
+      if (!raw) return
+      const parsed = JSON.parse(raw)
+      const validNames = new Set(TEMPLATES.map(t => t.name))
+      const pickValid = (list: unknown): string[] =>
+        Array.isArray(list) ? [...new Set(list.filter((n): n is string => typeof n === 'string'))].filter(n => validNames.has(n)) : []
+      favorites.value = pickValid(parsed?.favorites)
+      recentUsed.value = pickValid(parsed?.recent).slice(0, RECENT_LIMIT)
+    } catch {
+      notify('error', '本地收藏数据读取失败，已重置为空', { label: '重试', handler: () => loadTemplatePrefs() }, true)
+    }
+  }
+
+  function addFavorite(t: RegexTemplate): boolean {
+    if (favorites.value.includes(t.name)) {
+      // 重复收藏：不改变任何状态，给出定位到收藏入口的恢复方式
+      notify('info', `「${t.name}」已在收藏中，无需重复收藏`, { label: '查看收藏', handler: () => { templateTab.value = 'favorites' } })
+      return false
+    }
+    favorites.value = [...favorites.value, t.name]
+    persistTemplatePrefs()
+    notify('success', `已收藏「${t.name}」`, { label: '查看收藏', handler: () => { templateTab.value = 'favorites' } })
+    return true
+  }
+
+  function removeFavorite(t: RegexTemplate) {
+    if (!favorites.value.includes(t.name)) return
+    favorites.value = favorites.value.filter(n => n !== t.name)
+    persistTemplatePrefs()
+    notify('info', `已取消收藏「${t.name}」`, { label: '撤销', handler: () => addFavorite(t) })
+  }
+
+  function toggleFavorite(t: RegexTemplate) {
+    if (favorites.value.includes(t.name)) removeFavorite(t)
+    else addFavorite(t)
+  }
+
+  function clearTemplateFilters() {
+    templateSearch.value = ''
+    templateCategory.value = ''
+    templateTab.value = 'all'
+  }
+
+  const templateCategories = computed(() => {
+    const cats: string[] = []
+    for (const t of TEMPLATES) if (!cats.includes(t.category)) cats.push(t.category)
+    return cats
+  })
+
+  // 当前标签页（全部/收藏/最近）下的基础列表，分类与搜索在其上叠加
+  const tabBaseTemplates = computed<RegexTemplate[]>(() => {
+    if (templateTab.value === 'favorites') return TEMPLATES.filter(t => favorites.value.includes(t.name))
+    if (templateTab.value === 'recent') {
+      return recentUsed.value.map(n => TEMPLATES.find(t => t.name === n)).filter((t): t is RegexTemplate => !!t)
+    }
+    return TEMPLATES
+  })
+
+  const filteredTemplates = computed<RegexTemplate[]>(() => {
+    let list = tabBaseTemplates.value
+    if (templateCategory.value) list = list.filter(t => t.category === templateCategory.value)
+    const q = templateSearch.value.trim().toLowerCase()
+    if (q) {
+      list = list.filter(t =>
+        t.name.toLowerCase().includes(q) ||
+        t.description.toLowerCase().includes(q) ||
+        t.pattern.toLowerCase().includes(q) ||
+        t.category.toLowerCase().includes(q)
+      )
+    }
+    return list
+  })
+
+  // 分类数量与当前标签页的基础列表同源，保证计数与筛选结果一致
+  const categoryCounts = computed(() => {
+    const counts: Record<string, number> = {}
+    for (const t of tabBaseTemplates.value) counts[t.category] = (counts[t.category] || 0) + 1
+    return counts
+  })
+
+  const selectedTemplateVisible = computed(() =>
+    !!selectedTemplate.value && filteredTemplates.value.some(t => t.name === selectedTemplate.value)
+  )
+
+  loadTemplatePrefs()
 
   function execute() {
     error.value = ''
@@ -443,9 +577,12 @@ export const useRegexStore = defineStore('regex', () => {
   }
 
   function applyTemplate(t: RegexTemplate) {
+    // 只读取模板字段拷贝到编辑器状态，模板原对象保持冻结不变
     pattern.value = t.pattern
     testString.value = t.testString
     selectedTemplate.value = t.name
+    recentUsed.value = [t.name, ...recentUsed.value.filter(n => n !== t.name)].slice(0, RECENT_LIMIT)
+    persistTemplatePrefs()
     execute()
   }
 
@@ -482,7 +619,11 @@ export const useRegexStore = defineStore('regex', () => {
   return {
     pattern, testString, currentStep, isPlaying, nfa, matchResult, ast, error,
     selectedTemplate, groupColors, matchHighlight,
+    favorites, recentUsed, templateSearch, templateTab, templateCategory, toasts,
+    templateCategories, tabBaseTemplates, filteredTemplates, categoryCounts, selectedTemplateVisible,
     execute, setPattern, setTestString, applyTemplate,
+    toggleFavorite, addFavorite, removeFavorite, clearTemplateFilters,
+    dismissToast, persistTemplatePrefs,
     stepForward, stepBackward, resetStep, play, stop
   }
 })
